@@ -39,3 +39,4 @@ rstest.workspace = true
 tower = { version = "0.5.3", features = ["util"] }
 wiremock.workspace = true
 sha2.workspace = true
+libc = "0.2"

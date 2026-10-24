@@ -3805,6 +3805,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-util",
+ "libc",
  "litellm-auth",
  "litellm-cache-memory",
  "litellm-cache-response",

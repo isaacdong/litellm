@@ -2,6 +2,20 @@ mod support;
 
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
+use std::{
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::PathBuf,
+    process::Command,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(unix)]
+use libc::{ENXIO, O_NONBLOCK};
+
 use axum::{body::Body, http::Request};
 use litellm_gateway_inference::Deployment;
 use litellm_host::{
@@ -27,6 +41,24 @@ const HF_ARTIFACT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../litellm/litellm_core_utils/tokenizers/anthropic_tokenizer.json"
 ));
+
+#[cfg(unix)]
+struct FifoCleanup(PathBuf);
+
+#[cfg(unix)]
+impl Drop for FifoCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct ColdArtifactFeed {
+    reader_connected: bool,
+    progress_before_release: bool,
+    watchdog_released: bool,
+}
 
 fn local_config(engine: RawTextEngine, artifact: RawTextArtifact) -> LocalTokenizerConfig {
     LocalTokenizerConfig {
@@ -837,6 +869,7 @@ async fn local_facts_are_provider_zero_cost_and_observers_see_terminals() {
     ));
 }
 
+#[cfg(unix)]
 #[rstest]
 #[test]
 fn current_thread_executor_remains_responsive_during_cold_local_load_and_encoding() {
@@ -845,15 +878,104 @@ fn current_thread_executor_remains_responsive_during_cold_local_load_and_encodin
         .build()
         .unwrap()
         .block_on(async {
-            let app = support::app_with_deployment(local_deployment(local_config(
-                RawTextEngine::HuggingFace,
-                RawTextArtifact::Inline {
-                    content: HF_ARTIFACT.into(),
-                },
-            )));
-            let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let prompt = "hello ".repeat(100_000);
+            let artifact = small_hf_artifact();
+            let artifact_bytes = artifact.as_bytes().to_vec();
+            let artifact_path = std::env::temp_dir().join(format!(
+                "gateway-tokenize-cold-{}-{}.fifo",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _cleanup = FifoCleanup(artifact_path.clone());
+            let fifo_status = Command::new("mkfifo").arg(&artifact_path).status().unwrap();
+            assert!(fifo_status.success(), "mkfifo failed for {artifact_path:?}");
+
+            let config = LocalTokenizerConfig {
+                id: "gateway-cold-fifo".into(),
+                add_special_tokens: Some(true),
+                ..local_config(
+                    RawTextEngine::HuggingFace,
+                    RawTextArtifact::File {
+                        path: artifact_path.clone(),
+                        sha256: format!("{:x}", Sha256::digest(&artifact_bytes)),
+                    },
+                )
+            };
+            let app = support::app_with_deployment(local_deployment(config));
+            let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+            let (progress_tx, progress_rx) = mpsc::channel();
+            let (request_started_tx, request_started_rx) = mpsc::channel();
+            let writer = thread::spawn({
+                let artifact_path = artifact_path.clone();
+                move || -> std::io::Result<ColdArtifactFeed> {
+                    let release_watchdog = || -> std::io::Result<()> {
+                        let mut watchdog = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .custom_flags(O_NONBLOCK)
+                            .open(&artifact_path)?;
+                        watchdog.write_all(&artifact_bytes)?;
+                        thread::sleep(Duration::from_millis(100));
+                        Ok(())
+                    };
+                    if request_started_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .is_err()
+                    {
+                        release_watchdog()?;
+                        return Ok(ColdArtifactFeed {
+                            reader_connected: false,
+                            progress_before_release: false,
+                            watchdog_released: true,
+                        });
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let writer = loop {
+                        match std::fs::OpenOptions::new()
+                            .write(true)
+                            .custom_flags(O_NONBLOCK)
+                            .open(&artifact_path)
+                        {
+                            Ok(writer) => break Some(writer),
+                            Err(error)
+                                if error.raw_os_error() == Some(ENXIO)
+                                    && Instant::now() < deadline =>
+                            {
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(error) if error.raw_os_error() == Some(ENXIO) => break None,
+                            Err(error) => return Err(error),
+                        }
+                    };
+                    let Some(mut writer) = writer else {
+                        release_watchdog()?;
+                        return Ok(ColdArtifactFeed {
+                            reader_connected: false,
+                            progress_before_release: false,
+                            watchdog_released: true,
+                        });
+                    };
+                    let _ = connected_tx.send(());
+                    let progress_before_release =
+                        progress_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+                    writer.write_all(&artifact_bytes)?;
+                    Ok(ColdArtifactFeed {
+                        reader_connected: true,
+                        progress_before_release,
+                        watchdog_released: !progress_before_release,
+                    })
+                }
+            });
+            let progress_task = tokio::spawn(async move {
+                if connected_rx.await.is_ok() {
+                    let _ = progress_tx.send(());
+                }
+            });
+            let prompt = "hello world";
             let request = tokio::spawn(async move {
+                let _ = request_started_tx.send(());
                 app.oneshot(
                     Request::post("/tokenize")
                         .header("content-type", "application/json")
@@ -865,21 +987,27 @@ fn current_thread_executor_remains_responsive_during_cold_local_load_and_encodin
                 .await
                 .unwrap()
             });
-            tokio::task::yield_now().await;
-            let observed_ticks = Arc::clone(&ticks);
-            let heartbeat = tokio::spawn(async move {
-                loop {
-                    observed_ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    tokio::task::yield_now().await;
-                }
-            });
-            let response = tokio::time::timeout(std::time::Duration::from_secs(10), request)
-                .await
-                .unwrap()
-                .unwrap();
-            heartbeat.abort();
-            assert_eq!(response.status(), 200);
-            assert!(ticks.load(std::sync::atomic::Ordering::Relaxed) > 0);
+            let response_result = tokio::time::timeout(Duration::from_secs(10), request).await;
+            let writer_result = writer.join();
+            progress_task.abort();
+            let response = response_result.unwrap().unwrap();
+            let feed = writer_result.unwrap().unwrap();
+            let status = response.status();
+            let body = response_json(response).await;
+            assert!(
+                feed.reader_connected,
+                "native tokenizer never opened the FIFO"
+            );
+            assert!(
+                feed.progress_before_release,
+                "watchdog released FIFO bytes before event-loop progress"
+            );
+            assert!(
+                !feed.watchdog_released,
+                "watchdog released FIFO bytes before event-loop progress"
+            );
+            assert_eq!(status, 200);
+            assert_eq!(body["count"], 3);
         });
 }
 
