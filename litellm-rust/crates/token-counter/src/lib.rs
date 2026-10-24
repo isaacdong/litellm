@@ -15,8 +15,6 @@ mod types;
 pub mod fast;
 #[cfg(feature = "huggingface")]
 pub mod huggingface;
-#[cfg(all(feature = "huggingface", feature = "tiktoken"))]
-pub mod raw_text;
 #[cfg(feature = "tiktoken")]
 pub mod tiktoken;
 

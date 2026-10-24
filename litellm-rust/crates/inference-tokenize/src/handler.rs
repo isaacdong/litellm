@@ -1,7 +1,5 @@
-use std::sync::Arc;
 use std::time::Duration;
 
-use litellm_auth::InputSource;
 use litellm_host::{
     interceptors::{
         Cost, ExecutionFacts, Interceptors, ProviderIdentity, RequestContext, ResultSource,
@@ -17,10 +15,9 @@ use litellm_llms::base_llm::{
 };
 use litellm_llms_types::formats::tokenize::{TokenizeOutput, TokenizeResponse};
 use litellm_secrets::source::Secrets;
-use litellm_token_counter::raw_text::{RawTextEngine, RawTextIdentity};
 use serde_json::{Map, Value};
 
-use crate::{Error, TokenizeBackend, TokenizeRequest, TokenizeRoute};
+use crate::{Error, TokenizeRequest, TokenizeRoute};
 
 pub(crate) async fn execute(
     route: &TokenizeRoute,
@@ -105,7 +102,6 @@ pub(crate) async fn execute(
         .await
         .map_err(TransportError::from_reqwest_before_dispatch)?;
     let status = response.status();
-    let headers = response.headers().clone();
     if let (401, Some(config), Some(bearer)) =
         (status.as_u16(), iam_config.as_ref(), bearer.as_ref())
     {
@@ -117,11 +113,10 @@ pub(crate) async fn execute(
     }
     let text = response.text().await.map_err(TransportError::from)?;
     if !status.is_success() {
-        return Err(TransportError::from_response(
-            status.as_u16(),
-            litellm_http::request::truncate_error_body(&text),
-            &headers,
-        )
+        return Err(TransportError::Http {
+            status: status.as_u16(),
+            body: litellm_http::request::truncate_error_body(&text),
+        }
         .into());
     }
     context.response_received(&text).await?;
@@ -181,103 +176,6 @@ fn project_response(
         token_ids: require_ids.then_some(response.token_ids).flatten(),
         tokens: require_tokens.then_some(response.tokens).flatten(),
     })
-}
-
-pub(crate) async fn execute_local(
-    route: &TokenizeRoute,
-    call: TokenizeRequest,
-    interceptors: &impl Interceptors<Error>,
-    observers: Option<&ObservationSender>,
-) -> Result<TokenizeResponse, Error> {
-    let TokenizeBackend::Local { config } = call.backend else {
-        return Err(Error::Unsupported("local tokenizer backend"));
-    };
-    if config.source() == InputSource::Request {
-        return Err(Error::InvalidRequest(
-            "local tokenizer configuration must come from deployment or environment".into(),
-        ));
-    }
-    if call.api_key.is_some()
-        || call.api_base.is_some()
-        || !call.extra_headers.is_empty()
-        || !call.optional_params.is_empty()
-        || call.custom_llm_provider.is_some()
-    {
-        return Err(Error::InvalidRequest(
-            "provider credentials and parameters are not supported for local tokenization".into(),
-        ));
-    }
-    if call
-        .deployment_params
-        .values()
-        .any(|value| value.source() == InputSource::Request)
-    {
-        return Err(Error::InvalidRequest(
-            "request parameters cannot be deployment parameters".into(),
-        ));
-    }
-    let configured = config.value();
-    let configured = call.add_special_tokens.map_or_else(
-        || Arc::clone(configured),
-        |add_special_tokens| {
-            let mut overridden = (**configured).clone();
-            overridden.add_special_tokens = Some(add_special_tokens);
-            Arc::new(overridden)
-        },
-    );
-    let capabilities = litellm_llms::base_llm::tokenize::transformation::TokenizeCapabilities {
-        token_ids: true,
-        tokens: matches!(&configured.engine, RawTextEngine::HuggingFace),
-    };
-    let output = call.include.output();
-    if !capabilities.supports(output) {
-        return Err(Error::Unsupported("requested tokenize output"));
-    }
-    let prompt = call.prompt;
-    let tokenizer = route.local_registry.preload(configured).await?;
-    let result = if output == TokenizeOutput::Count {
-        let count = route
-            .local_registry
-            .count(Arc::clone(&tokenizer), prompt)
-            .await?;
-        litellm_token_counter::raw_text::RawTextEncoding {
-            count,
-            token_ids: None,
-            tokens: None,
-        }
-    } else {
-        route
-            .local_registry
-            .encode(
-                Arc::clone(&tokenizer),
-                prompt,
-                matches!(output, TokenizeOutput::Ids | TokenizeOutput::Both),
-                matches!(output, TokenizeOutput::Tokens | TokenizeOutput::Both),
-            )
-            .await?
-    };
-    let identity: &RawTextIdentity = tokenizer.identity();
-    let response = TokenizeResponse {
-        model: identity.id.clone(),
-        count: result.count as u64,
-        token_ids: result
-            .token_ids
-            .map(|ids| ids.into_iter().map(u64::from).collect()),
-        tokens: result.tokens,
-    };
-    CallContext::new(interceptors, observers.cloned().into())
-        .result_ready(ExecutionFacts {
-            provider: ProviderIdentity {
-                model: identity.id.clone(),
-                provider: "local".into(),
-            },
-            cost: Cost::Reported {
-                amount: serde_json::Number::from(0),
-            },
-            source: ResultSource::Provider,
-        })
-        .await?;
-    Ok(response)
 }
 
 #[cfg(test)]

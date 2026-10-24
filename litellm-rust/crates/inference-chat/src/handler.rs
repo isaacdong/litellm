@@ -115,7 +115,6 @@ pub(super) async fn execute(
                 })?;
 
             let status = response.status();
-            let response_headers = response.headers().clone();
             let text = response.text().await.map_err(|err| {
                 Error::Transport(litellm_http::transport::Error::Network(err.to_string()))
             })?;
@@ -124,7 +123,6 @@ pub(super) async fn execute(
                 return Err(Error::Transport(litellm_http::transport::Error::Http {
                     status: status.as_u16(),
                     body: truncate_error_body(&text),
-                    headers: litellm_http::transport::safe_headers(&response_headers),
                 }));
             }
             let raw = RawResponse { body: text.clone() };
@@ -368,7 +366,6 @@ mod tests {
         let upstream = Error::Transport(litellm_http::transport::Error::Http {
             status: 500,
             body: "boom".to_string(),
-            headers: Default::default(),
         });
         assert_eq!(as_response_error(upstream.clone()), upstream);
     }

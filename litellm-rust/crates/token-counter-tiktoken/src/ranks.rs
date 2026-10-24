@@ -108,7 +108,7 @@ pub(super) fn load(
     Ok((loaded, requested))
 }
 
-pub(super) fn build(name: &str, ranks: &str) -> Result<Loaded, LoadError> {
+fn build(name: &str, ranks: &str) -> Result<Loaded, LoadError> {
     let parsed = ranks
         .lines()
         .map(parse_rank)

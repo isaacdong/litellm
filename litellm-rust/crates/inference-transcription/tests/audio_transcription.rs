@@ -225,8 +225,7 @@ async fn an_upstream_error_keeps_its_status_and_body(
         error,
         Error::Transport(litellm_http::transport::Error::Http {
             status,
-            body: "upstream said no".into(),
-            headers: Default::default()
+            body: "upstream said no".into()
         })
     );
 }

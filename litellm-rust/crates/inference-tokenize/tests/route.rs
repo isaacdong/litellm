@@ -13,11 +13,8 @@ use litellm_host::{
 use litellm_host_native::in_process::{Host, run_hosted};
 use litellm_http::{Client, transport::Error as TransportError};
 use litellm_inference_testing::{RecordingSecrets, no_secrets};
-use litellm_inference_tokenize::{
-    Error, LocalTokenizerRegistry, TokenizeBackend, TokenizeRequest, TokenizeRoute,
-};
+use litellm_inference_tokenize::{Error, TokenizeRequest, TokenizeRoute};
 use litellm_llms_types::formats::tokenize::TokenizeInclude;
-use litellm_token_counter::raw_text::{LocalTokenizerConfig, RawTextArtifact, RawTextEngine};
 use rstest::{fixture, rstest};
 use serde_json::{Value, json};
 use wiremock::{
@@ -63,48 +60,6 @@ fn assert_credential_boundary_error(error: &Error) {
             .contains("request-controlled inputs cannot be combined with host credentials"),
         "{error:?}"
     );
-}
-
-fn local_config(engine: RawTextEngine, artifact: RawTextArtifact) -> Arc<LocalTokenizerConfig> {
-    Arc::new(LocalTokenizerConfig {
-        id: "local-test".into(),
-        revision: "revision".into(),
-        engine,
-        artifact,
-        special_text: None,
-        add_special_tokens: None,
-    })
-}
-
-fn local_hugging_face_postprocessor_artifact() -> String {
-    let mut artifact: Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../litellm/litellm_core_utils/tokenizers/anthropic_tokenizer.json"
-    )))
-    .unwrap();
-    artifact["post_processor"] = json!({
-        "type": "TemplateProcessing",
-        "single": [
-            {"SpecialToken": {"id": "<EOT>", "type_id": 0}},
-            {"Sequence": {"id": "A", "type_id": 0}}
-        ],
-        "pair": [],
-        "special_tokens": {
-            "<EOT>": {"id": "<EOT>", "ids": [0], "tokens": ["<EOT>"]}
-        }
-    });
-    serde_json::to_string(&artifact).unwrap()
-}
-
-fn local_call(config: Arc<LocalTokenizerConfig>, source: InputSource) -> TokenizeRequest {
-    TokenizeRequest {
-        model: "local-test".into(),
-        prompt: "hello".into(),
-        backend: TokenizeBackend::Local {
-            config: sourced_at(config, source),
-        },
-        ..Default::default()
-    }
 }
 
 #[rstest]
@@ -371,47 +326,6 @@ async fn upstream_status_is_preserved_without_replaying(route: TokenizeRoute, #[
     assert!(
         matches!(error,Error::Transport(TransportError::Http {status: actual,..}) if actual==status)
     );
-}
-
-#[rstest]
-#[tokio::test]
-async fn rate_limit_metadata_is_preserved_without_forwarding_sensitive_headers(
-    route: TokenizeRoute,
-) {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(429)
-                .insert_header("retry-after", "7")
-                .insert_header("x-request-id", "request-429")
-                .insert_header("authorization", "Bearer private"),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-    let error = route
-        .execute(
-            TokenizeRequest {
-                model: "vllm/model".into(),
-                prompt: "hello".into(),
-                api_base: Some(sourced(server.uri())),
-                ..Default::default()
-            },
-            &(),
-            None,
-        )
-        .await
-        .unwrap_err();
-    let Error::Transport(TransportError::Http {
-        status, headers, ..
-    }) = error
-    else {
-        panic!("expected upstream HTTP error")
-    };
-    assert_eq!(status, 429);
-    assert_eq!(headers.get("retry-after").unwrap(), "7");
-    assert_eq!(headers.get("x-request-id").unwrap(), "request-429");
-    assert!(!headers.contains_key("authorization"));
 }
 
 #[rstest]
@@ -818,171 +732,6 @@ async fn directly_constructed_empty_model_is_rejected_before_dispatch(route: Tok
 }
 
 #[rstest]
-#[case::count(false, false)]
-#[case::ids(true, false)]
-#[case::tokens(false, true)]
-#[case::both(true, true)]
-#[tokio::test]
-async fn local_output_modes_return_only_requested_representations(
-    route: TokenizeRoute,
-    #[case] ids: bool,
-    #[case] tokens: bool,
-) {
-    let route = route.with_local_registry(Arc::new(LocalTokenizerRegistry::with_capacity(4)));
-    let mut call = local_call(
-        local_config(
-            RawTextEngine::HuggingFace,
-            RawTextArtifact::Inline {
-                content: local_hugging_face_postprocessor_artifact(),
-            },
-        ),
-        InputSource::Deployment,
-    );
-    call.include = TokenizeInclude::new(ids, tokens);
-    let response = route.execute(call, &(), None).await.unwrap();
-
-    assert!(response.count > 0);
-    assert_eq!(
-        response.token_ids.as_ref().map(Vec::len),
-        ids.then_some(response.count as usize)
-    );
-    assert_eq!(response.token_ids.is_some(), ids);
-    assert_eq!(response.tokens.is_some(), tokens);
-}
-
-#[rstest]
-#[tokio::test]
-async fn request_sourced_local_file_config_is_rejected_before_file_access(route: TokenizeRoute) {
-    let request = local_call(
-        local_config(
-            RawTextEngine::HuggingFace,
-            RawTextArtifact::File {
-                path: "/missing/request-tokenizer.json".into(),
-                sha256: "0".repeat(64),
-            },
-        ),
-        InputSource::Request,
-    );
-    let error = route.execute(request, &(), None).await.unwrap_err();
-
-    assert!(error.to_string().contains("deployment or environment"));
-    assert!(
-        !error
-            .to_string()
-            .contains("failed to read tokenizer artifact")
-    );
-}
-
-#[rstest]
-#[tokio::test]
-async fn unsupported_local_pieces_are_rejected_before_file_access(route: TokenizeRoute) {
-    let mut request = local_call(
-        local_config(
-            RawTextEngine::Tiktoken {
-                encoding: "cl100k_base".into(),
-            },
-            RawTextArtifact::File {
-                path: "/missing/request-ranks.tiktoken".into(),
-                sha256: "0".repeat(64),
-            },
-        ),
-        InputSource::Deployment,
-    );
-    request.include = TokenizeInclude::new(false, true);
-    let error = route.execute(request, &(), None).await.unwrap_err();
-
-    assert!(matches!(
-        error,
-        Error::Unsupported("requested tokenize output")
-    ));
-}
-
-#[rstest]
-#[tokio::test]
-async fn local_calls_reject_provider_credentials_and_parameters(route: TokenizeRoute) {
-    let mut request = local_call(
-        local_config(
-            RawTextEngine::HuggingFace,
-            RawTextArtifact::Inline {
-                content: include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../../litellm/litellm_core_utils/tokenizers/anthropic_tokenizer.json"
-                ))
-                .into(),
-            },
-        ),
-        InputSource::Deployment,
-    );
-    request.api_key = Some(sourced(SecretValue::new("not-used")));
-    request.api_base = Some(sourced("https://example.invalid".into()));
-    request.optional_params = sourced_map(&json!({"add_special_tokens":false}));
-
-    let error = route.execute(request, &(), None).await.unwrap_err();
-
-    assert!(
-        error
-            .to_string()
-            .contains("provider credentials and parameters")
-    );
-}
-
-#[rstest]
-#[tokio::test]
-async fn local_success_reports_identity_and_zero_cost_without_provider_hooks(route: TokenizeRoute) {
-    let route = route.with_local_registry(Arc::new(LocalTokenizerRegistry::with_capacity(2)));
-    let hooks = Hooks::default();
-    let mut request = local_call(
-        local_config(
-            RawTextEngine::HuggingFace,
-            RawTextArtifact::Inline {
-                content: include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../../litellm/litellm_core_utils/tokenizers/anthropic_tokenizer.json"
-                ))
-                .into(),
-            },
-        ),
-        InputSource::Environment,
-    );
-    request.model = "public-alias".into();
-    let response = route.execute(request.clone(), &hooks, None).await.unwrap();
-
-    assert_eq!(response.model, "local-test");
-    assert!(hooks.context.lock().unwrap().is_none());
-    assert!(hooks.raw.lock().unwrap().is_none());
-    let facts = hooks.facts.lock().unwrap().clone().unwrap();
-    assert_eq!(
-        facts.source,
-        litellm_host::interceptors::ResultSource::Provider
-    );
-    assert_eq!(facts.provider.model, "local-test");
-    assert_eq!(facts.provider.provider, "local");
-    assert_eq!(
-        facts.cost,
-        litellm_host::interceptors::Cost::Reported {
-            amount: serde_json::Number::from(0)
-        }
-    );
-
-    let warm_hooks = Hooks::default();
-    let warm_response = route.execute(request, &warm_hooks, None).await.unwrap();
-    assert_eq!(warm_response.model, "local-test");
-    let warm_facts = warm_hooks.facts.lock().unwrap().clone().unwrap();
-    assert_eq!(
-        warm_facts.source,
-        litellm_host::interceptors::ResultSource::Provider
-    );
-    assert_eq!(
-        warm_facts.cost,
-        litellm_host::interceptors::Cost::Reported {
-            amount: serde_json::Number::from(0)
-        }
-    );
-    assert!(warm_hooks.context.lock().unwrap().is_none());
-    assert!(warm_hooks.raw.lock().unwrap().is_none());
-}
-
-#[rstest]
 #[tokio::test]
 async fn unsupported_provider_representation_fails_before_secret_resolution() {
     let secrets = Arc::new(RecordingSecrets::new([(
@@ -1119,67 +868,6 @@ async fn duplicate_special_token_policy_is_rejected_before_provider_io(route: To
 
     assert!(error.to_string().contains("both"));
     assert!(server.received_requests().await.unwrap().is_empty());
-}
-
-#[rstest]
-#[tokio::test]
-async fn local_hugging_face_special_token_override_is_policy_scoped(route: TokenizeRoute) {
-    let route = route.with_local_registry(Arc::new(LocalTokenizerRegistry::with_capacity(4)));
-    let configured = {
-        let mut config = (*local_config(
-            RawTextEngine::HuggingFace,
-            RawTextArtifact::Inline {
-                content: local_hugging_face_postprocessor_artifact(),
-            },
-        ))
-        .clone();
-        config.add_special_tokens = Some(false);
-        Arc::new(config)
-    };
-
-    let omitted = route
-        .execute(
-            local_call(Arc::clone(&configured), InputSource::Deployment),
-            &(),
-            None,
-        )
-        .await
-        .unwrap()
-        .count;
-    let mut explicit_true = local_call(Arc::clone(&configured), InputSource::Deployment);
-    explicit_true.add_special_tokens = Some(true);
-    let enabled = route.execute(explicit_true, &(), None).await.unwrap().count;
-    let mut explicit_false = local_call(configured, InputSource::Deployment);
-    explicit_false.add_special_tokens = Some(false);
-    let disabled = route
-        .execute(explicit_false, &(), None)
-        .await
-        .unwrap()
-        .count;
-
-    assert!(enabled > omitted);
-    assert_eq!(disabled, omitted);
-}
-
-#[rstest]
-#[tokio::test]
-async fn local_tiktoken_special_token_insertion_is_rejected(route: TokenizeRoute) {
-    let mut request = local_call(
-        local_config(
-            RawTextEngine::Tiktoken {
-                encoding: "cl100k_base".into(),
-            },
-            RawTextArtifact::Inline {
-                content: String::new(),
-            },
-        ),
-        InputSource::Deployment,
-    );
-    request.add_special_tokens = Some(true);
-
-    let error = route.execute(request, &(), None).await.unwrap_err();
-
-    assert!(error.to_string().contains("add_special_tokens"));
 }
 
 #[rstest]

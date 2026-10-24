@@ -205,8 +205,7 @@ async fn an_upstream_error_status_keeps_its_code_and_body(
         error,
         Error::Transport(TransportError::Http {
             status,
-            body: "slow down".into(),
-            headers: Default::default()
+            body: "slow down".into()
         })
     );
 }

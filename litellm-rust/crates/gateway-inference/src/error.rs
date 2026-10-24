@@ -180,7 +180,6 @@ mod tests {
         Error::Route(InferenceError::Transport(TransportError::Http {
             status,
             body: body.into(),
-            headers: Default::default(),
         }))
     }
 

@@ -1,9 +1,8 @@
-mod error;
 mod handler;
 mod route;
 mod types;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use litellm_auth::AuthServices;
 use litellm_core_utils::get_llm_provider_logic::LlmProviders;
@@ -17,21 +16,16 @@ use litellm_llms::{
 };
 use litellm_llms_types::formats::tokenize::TokenizeResponse;
 use litellm_secrets::source::SecretSource;
-mod local;
 
 pub use litellm_inference::Error;
-pub use local::LocalTokenizerRegistry;
 pub use route::{Tokenize, TokenizeCall, TokenizeMachine};
-pub use types::{TokenizeBackend, TokenizeRequest};
-
-static DEFAULT_LOCAL_REGISTRY: OnceLock<Arc<LocalTokenizerRegistry>> = OnceLock::new();
+pub use types::TokenizeRequest;
 
 #[derive(Clone)]
 pub struct TokenizeRoute {
     http: Client,
     auth: Arc<AuthServices>,
     secrets: Arc<dyn SecretSource>,
-    local_registry: Arc<LocalTokenizerRegistry>,
 }
 
 impl TokenizeRoute {
@@ -40,15 +34,7 @@ impl TokenizeRoute {
             http,
             auth,
             secrets,
-            local_registry: Arc::clone(
-                DEFAULT_LOCAL_REGISTRY.get_or_init(|| Arc::new(LocalTokenizerRegistry::new())),
-            ),
         }
-    }
-
-    pub fn with_local_registry(mut self, registry: Arc<LocalTokenizerRegistry>) -> Self {
-        self.local_registry = registry;
-        self
     }
 
     pub async fn execute(
@@ -77,9 +63,6 @@ impl TokenizeRoute {
         litellm_inference::diagnostic::unary(async {
             if call.model.is_empty() {
                 return Err(Error::InvalidRequest("model must not be empty".into()));
-            }
-            if matches!(&call.backend, TokenizeBackend::Local { .. }) {
-                return handler::execute_local(self, call, interceptors, observers).await;
             }
             let provider =
                 resolve_llm_provider(&call.model, call.custom_llm_provider.as_deref(), "tokenize")?;
