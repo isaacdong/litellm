@@ -67,7 +67,7 @@ impl TokenizeRoute {
             let provider =
                 resolve_llm_provider(&call.model, call.custom_llm_provider.as_deref(), "tokenize")?;
             let config: &dyn BaseTokenizeConfig = match provider.provider {
-                LlmProviders::HostedVllm | LlmProviders::Vllm => &HostedVllmTokenizeConfig,
+                LlmProviders::HostedVllm => &HostedVllmTokenizeConfig,
                 LlmProviders::Watsonx => &WatsonxTokenizeConfig,
                 _ => return Err(Error::Unsupported("tokenize provider")),
             };

@@ -42,8 +42,6 @@ pub enum LlmProviders {
     Tencent,
     #[strum(serialize = "vertex_ai")]
     VertexAi,
-    #[strum(serialize = "vllm")]
-    Vllm,
     #[strum(serialize = "watsonx")]
     Watsonx,
 }

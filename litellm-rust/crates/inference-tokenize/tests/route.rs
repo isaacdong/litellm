@@ -313,7 +313,7 @@ async fn upstream_status_is_preserved_without_replaying(route: TokenizeRoute, #[
     let error = route
         .execute(
             TokenizeRequest {
-                model: "vllm/model".into(),
+                model: "hosted_vllm/model".into(),
                 prompt: "hello".into(),
                 api_base: Some(sourced(server.uri())),
                 ..Default::default()
@@ -646,7 +646,7 @@ async fn unsupported_deployment_defaults_are_filtered_before_provider_validation
     let error = route()
         .execute(
             TokenizeRequest {
-                model: "vllm/model".into(),
+                model: "hosted_vllm/model".into(),
                 prompt: "hello".into(),
                 api_base: Some(sourced(server.uri())),
                 deployment_params: BTreeMap::from([(
@@ -669,7 +669,7 @@ async fn request_owned_values_cannot_be_smuggled_through_deployment_parameters()
     let error = route()
         .execute(
             TokenizeRequest {
-                model: "vllm/model".into(),
+                model: "hosted_vllm/model".into(),
                 api_base: Some(sourced(server.uri())),
                 deployment_params: BTreeMap::from([("temperature".into(), sourced(json!(0.2)))]),
                 ..Default::default()
@@ -685,6 +685,7 @@ async fn request_owned_values_cannot_be_smuggled_through_deployment_parameters()
 
 #[rstest]
 #[case::unsupported_provider("gemini/model", json!({}))]
+#[case::bare_vllm_is_not_hosted_vllm("vllm/model", json!({}))]
 #[case::unknown_option("hosted_vllm/model", json!({"messages":[]}))]
 #[tokio::test]
 async fn unsupported_calls_fail_before_dispatch(
