@@ -4,9 +4,8 @@ use axum::{Json, Router, extract::State, response::Response, routing::post};
 use litellm_auth::{InputSource, SecretValue, Sourced};
 use litellm_gateway_auth::AuthenticatedRequest;
 use litellm_host::{interceptors::Interceptors, observation::ObservationSender};
-use litellm_inference_tokenize::{TokenizeBackend, TokenizeRequest};
+use litellm_inference_tokenize::TokenizeRequest;
 use litellm_llms_types::formats::tokenize::TokenizeRequest as TokenizePayload;
-use litellm_token_counter::raw_text::LocalTokenizerConfig;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -19,20 +18,8 @@ struct TokenizeState<H> {
     observers: Option<ObservationSender>,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum ConfiguredBackend {
-    #[default]
-    Provider,
-    Local {
-        config: LocalTokenizerConfig,
-    },
-}
-
 #[derive(Deserialize)]
 struct DeploymentOptions {
-    #[serde(default)]
-    backend: ConfiguredBackend,
     extra_headers: Option<Map<String, Value>>,
     #[serde(flatten)]
     params: Map<String, Value>,
@@ -60,20 +47,6 @@ async fn create<H>(
     State(state): State<TokenizeState<H>>,
     identity: AuthenticatedRequest,
     JsonObject(body): JsonObject,
-) -> Response
-where
-    H: Interceptors<litellm_inference::Error> + Clone + 'static,
-{
-    match handle(state, identity, body).await {
-        Ok(response) => response,
-        Err(error) => error_response(error),
-    }
-}
-
-async fn handle<H>(
-    state: TokenizeState<H>,
-    identity: AuthenticatedRequest,
-    body: Map<String, Value>,
 ) -> Result<Response, Error>
 where
     H: Interceptors<litellm_inference::Error> + Clone + 'static,
@@ -108,12 +81,6 @@ fn project(payload: TokenizePayload, deployment: &Deployment) -> Result<Tokenize
             .collect(),
     ))
     .map_err(|_| Error::InvalidBody("invalid tokenization deployment configuration".into()))?;
-    let backend = match options.backend {
-        ConfiguredBackend::Provider => TokenizeBackend::Provider,
-        ConfiguredBackend::Local { config } => TokenizeBackend::Local {
-            config: Sourced::new(Arc::new(config), InputSource::Deployment),
-        },
-    };
     let params = options
         .params
         .into_iter()
@@ -127,7 +94,6 @@ fn project(payload: TokenizePayload, deployment: &Deployment) -> Result<Tokenize
         .collect();
     Ok(TokenizeRequest {
         model: deployment.model.clone(),
-        backend,
         custom_llm_provider: deployment.custom_llm_provider.clone(),
         api_key: deployment
             .api_key
@@ -149,18 +115,4 @@ fn deployment_values(values: Map<String, Value>) -> BTreeMap<String, Sourced<Val
         .into_iter()
         .map(|(name, value)| (name, Sourced::new(value, InputSource::Deployment)))
         .collect()
-}
-
-fn error_response(error: Error) -> Response {
-    let headers = match &error {
-        Error::Route(litellm_inference::Error::Transport(
-            litellm_http::transport::Error::Http { headers, .. },
-        )) => Some(litellm_http::transport::safe_headers(headers)),
-        _ => None,
-    };
-    let mut response = error.openai_response();
-    if let Some(headers) = headers {
-        response.headers_mut().extend(*headers);
-    }
-    response
 }

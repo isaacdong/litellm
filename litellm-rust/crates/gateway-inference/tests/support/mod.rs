@@ -42,14 +42,11 @@ pub fn app_with_permissions(
 }
 
 pub fn app_with_deployment(deployment: Deployment) -> Router {
-    app_with_deployment_permissions(deployment, litellm_gateway_auth::Permissions::All)
-}
-
-pub fn app_with_deployment_permissions(
-    deployment: Deployment,
-    permissions: litellm_gateway_auth::Permissions,
-) -> Router {
-    configured_router(gateway_with_deployment(deployment), permissions, None)
+    configured_router(
+        gateway_with_deployment(deployment),
+        litellm_gateway_auth::Permissions::All,
+        None,
+    )
 }
 
 pub fn app_with_tokenize_hooks<H>(
@@ -115,7 +112,7 @@ fn configured_app(
     configured_router(Arc::new(gateway), permissions, principal)
 }
 
-pub fn gateway_with_deployment(deployment: Deployment) -> Arc<Gateway> {
+fn gateway_with_deployment(deployment: Deployment) -> Arc<Gateway> {
     Arc::new(build_gateway(deployment))
 }
 
